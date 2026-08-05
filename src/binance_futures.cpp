@@ -7,6 +7,7 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 */
 
 #include "stonky/binance/binance_futures_rest_client.h"
+#include "stonky/binance/binance_http_session.h"
 #include "stonky/binance/binance_ws_stream_manager.h"
 #include "stonky/binance/binance.h"
 #include "stonky/utils/utils.h"
@@ -18,12 +19,15 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include <spdlog/sinks/basic_file_sink.h>
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include "magic_enum/magic_enum.hpp"
 
 #define PLUGIN_VERSION    2
 #define PLUGIN_VERSION_STR "1.0.0"
 #define PLUGIN_VERSION_RELEASE_DATE "13-november-2025"
 #undef min
+/// Zorro's trading.h defines NEW as a chart flag, which collides with futures::OrderStatus::NEW
+#undef NEW
 
 #define ZORRO_REG_KEY "SOFTWARE\\Zorro"
 #define LAST_ORDER_ID_KEY "BinanceLastOrderId"
@@ -32,14 +36,24 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 using namespace std::chrono_literals;
 using namespace stonky::binance;
 
+/// Maximum time spent waiting for a price of an asset before the REST snapshot fallback kicks in
+static constexpr int STREAM_READ_TIMEOUT_S = 5;
+
+/// A cached tick older than this is considered unusable and is refreshed over REST. Must be generous enough for
+/// illiquid symbols whose best bid/ask legitimately does not move for a long time.
+static constexpr int MAX_TICK_AGE_S = 60;
+
+/// Period of the background refresh of the exchange info (symbol filters, precisions, ...)
+static constexpr int EXCHANGE_UPDATE_PERIOD_S = 900;
+
 static std::string currentSymbol;
 static std::string accountCurrency;
 static int lastOrderId = 0;
 static int orderType = 0;
 static bool hedge = false;
 static double lotAmount = 1.0;
-static int loopMs = 50; // Actually unused
-static int waitMs = 30000; // Actually unused
+static int loopMs = 50; // Zorro loop time, kept for GET_DELAY only
+static int waitMs = STREAM_READ_TIMEOUT_S * 1000; // Maximum broker response time, drives the stream read timeout
 std::atomic exchangeUpdaterRunning = false;
 std::thread exchangeUpdater;
 
@@ -103,25 +117,21 @@ void logFunction(const stonky::LogSeverity severity, const std::string &errmsg) 
 
 void exchangeUpdaterFunc() {
 	exchangeUpdaterRunning = true;
-	int numPass = 60;
 
-	std::unique_ptr<futures::RESTClient> restClientUpdater;
+	/// Refresh right away, then periodically. The exchange info is a multi megabyte payload, downloading it more
+	/// often than the symbol filters can realistically change is a waste of bandwidth and API weight.
+	int numPass = EXCHANGE_UPDATE_PERIOD_S;
 
 	while (exchangeUpdaterRunning) {
-		if (numPass == 60) {
+		if (numPass >= EXCHANGE_UPDATE_PERIOD_S) {
 			numPass = 0;
-			try {
-				if (!restClientUpdater) {
-					restClientUpdater = std::make_unique<futures::RESTClient>("", "");
-				}
 
-				if (restClientUpdater) {
-					restClient->setExchangeInfo(restClientUpdater->getExchangeInfo(true));
+			try {
+				if (restClient) {
+					restClient->updateExchangeInfo(true);
 				}
 			} catch (std::exception &e) {
 				spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
-				spdlog::info(fmt::format("Resetting restClientUpdater, {}", MAKE_FILELINE));
-				restClientUpdater = std::make_unique<futures::RESTClient>("", "");
 			}
 		}
 		std::this_thread::sleep_for(1s);
@@ -162,62 +172,85 @@ void readLastOrderId() {
 	}
 }
 
-std::string findAssetForTradeId(int tradeId, bool erase = true) {
-	if (std::ifstream ifs(OPEN_TRADES_FILE); ifs.is_open()) {
-		nlohmann::json json;
-		json = nlohmann::json::parse(ifs);
-		ifs.close();
+/// Zorro identifies a trade by the id returned from BrokerBuy2, the exchange needs the symbol for every subsequent
+/// operation. The mapping is persisted so that it survives a Zorro restart.
+struct OpenTrade {
+	std::string asset;
+	int lots{0}; /// Remaining open lots, 0 for records written by older plugin versions
+};
 
-		if (auto it = json.find("openTrades"); it != json.end()) {
-			std::map<int, std::string> openTrades;
-			openTrades = it->get<std::map<int, std::string> >();
+/// Ids of recently closed trades, so that BrokerTrade can tell "fully closed" (-1) apart from "unknown" (NAY)
+static constexpr std::size_t MAX_CLOSED_TRADES = 200;
 
-			if (const auto tradeIt = openTrades.find(tradeId); tradeIt != openTrades.end()) {
-				auto retVal = tradeIt->second;
+struct TradeStore {
+	std::map<int, OpenTrade> open;
+	std::vector<int> closed; /// Oldest first, capped at MAX_CLOSED_TRADES
+};
 
-				if (erase) {
-					openTrades.erase(tradeIt);
+TradeStore loadTrades() {
+	TradeStore store;
 
-					json["openTrades"] = openTrades;
+	try {
+		std::ifstream ifs(OPEN_TRADES_FILE);
 
-					if (std::ofstream ofs(OPEN_TRADES_FILE); ofs.is_open()) {
-						ofs << json.dump(4);
-						ofs.close();
-					} else {
-						spdlog::error(fmt::format("Couldn't save json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE));
+		if (!ifs.is_open()) {
+			return store;
+		}
+
+		const nlohmann::json json = nlohmann::json::parse(ifs, nullptr, false);
+
+		if (json.is_discarded()) {
+			spdlog::error(fmt::format("Malformed json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE));
+			return store;
+		}
+
+		if (const auto it = json.find("openTrades"); it != json.end() && it->is_object()) {
+			for (const auto &[key, value]: it->items()) {
+				OpenTrade openTrade;
+
+				if (value.is_string()) {
+					/// Legacy format - the symbol was stored alone, the open size is unknown
+					openTrade.asset = value.get<std::string>();
+				} else if (value.is_object()) {
+					if (const auto assetIt = value.find("asset"); assetIt != value.end()) {
+						openTrade.asset = assetIt->get<std::string>();
+					}
+
+					if (const auto lotsIt = value.find("lots"); lotsIt != value.end()) {
+						openTrade.lots = lotsIt->get<int>();
 					}
 				}
 
-				return retVal;
+				if (!openTrade.asset.empty()) {
+					store.open.insert_or_assign(std::stoi(key), openTrade);
+				}
 			}
 		}
+
+		if (const auto it = json.find("closedTrades"); it != json.end() && it->is_array()) {
+			store.closed = it->get<std::vector<int> >();
+		}
+	} catch (std::exception &e) {
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
 	}
-	spdlog::error(fmt::format("Could not find Asset for trade id: {}, {}", tradeId, MAKE_FILELINE));
-	return {};
+
+	return store;
 }
 
-void saveAssetForTradeId(const std::string &asset, int tradeId) {
+void saveTrades(const TradeStore &store) {
 	try {
-		std::ifstream ifs(OPEN_TRADES_FILE);
+		auto tradesJson = nlohmann::json::object();
+
+		for (const auto &[tradeId, openTrade]: store.open) {
+			tradesJson[std::to_string(tradeId)] = {{"asset", openTrade.asset}, {"lots", openTrade.lots}};
+		}
+
 		nlohmann::json json;
-		std::map<int, std::string> openTrades;
-
-		if (ifs.is_open()) {
-			json = nlohmann::json::parse(ifs);
-			ifs.close();
-		}
-
-		if (auto it = json.find("openTrades"); it != json.end()) {
-			openTrades = it->get<std::map<int, std::string> >();
-			openTrades.insert_or_assign(tradeId, asset);
-		} else {
-			openTrades.insert_or_assign(tradeId, asset);
-		}
-		json["openTrades"] = openTrades;
+		json["openTrades"] = tradesJson;
+		json["closedTrades"] = store.closed;
 
 		if (std::ofstream ofs(OPEN_TRADES_FILE); ofs.is_open()) {
 			ofs << json.dump(4);
-			ofs.close();
 		} else {
 			spdlog::error(fmt::format("Couldn't save json file, path: {}, {}", OPEN_TRADES_FILE, MAKE_FILELINE));
 		}
@@ -226,11 +259,75 @@ void saveAssetForTradeId(const std::string &asset, int tradeId) {
 	}
 }
 
+/// BrokerTrade is polled per open trade, so the store is kept in memory and only written through on a change
+static std::optional<TradeStore> tradeStoreCache;
+
+TradeStore &tradeStore() {
+	if (!tradeStoreCache) {
+		tradeStoreCache = loadTrades();
+	}
+
+	return *tradeStoreCache;
+}
+
+std::optional<OpenTrade> findOpenTrade(const int tradeId) {
+	const auto &store = tradeStore();
+
+	if (const auto it = store.open.find(tradeId); it != store.open.end()) {
+		return it->second;
+	}
+
+	spdlog::error(fmt::format("Could not find Asset for trade id: {}, {}", tradeId, MAKE_FILELINE));
+	return {};
+}
+
+bool wasTradeClosed(const int tradeId) {
+	const auto &store = tradeStore();
+	return std::ranges::find(store.closed, tradeId) != store.closed.end();
+}
+
+void storeOpenTrade(const int tradeId, const std::string &asset, const int lots) {
+	auto &store = tradeStore();
+	store.open.insert_or_assign(tradeId, OpenTrade{asset, lots});
+	saveTrades(store);
+}
+
+/**
+ * Account for lots that have just been closed. Once nothing is left open the record moves to the capped list of
+ * closed trades, which both keeps the file from growing forever and lets BrokerTrade report a closed trade.
+ * @param tradeId
+ * @param closedLots absolute number of closed lots
+ */
+void reduceOpenTrade(const int tradeId, const int closedLots) {
+	auto &store = tradeStore();
+	const auto it = store.open.find(tradeId);
+
+	if (it == store.open.end()) {
+		return;
+	}
+
+	if (const auto remaining = std::abs(it->second.lots) - std::abs(closedLots); remaining > 0) {
+		it->second.lots = it->second.lots < 0 ? -remaining : remaining;
+	} else {
+		store.open.erase(it);
+		store.closed.push_back(tradeId);
+
+		if (store.closed.size() > MAX_CLOSED_TRADES) {
+			store.closed.erase(store.closed.begin(),
+			                   store.closed.begin() + static_cast<long>(store.closed.size() - MAX_CLOSED_TRADES));
+		}
+	}
+
+	saveTrades(store);
+}
+
 DLLFUNC_C int BrokerLogin(char *User, char *Pwd, char *Type, char *Account) {
 	if (!User) {
 		stopExchangeUpdater();
 		streamManager.reset();
 		restClient.reset();
+		/// Drop the cached trade store, it is re-read from disk on the next login
+		tradeStoreCache.reset();
 		spdlog::info("Logout");
 		spdlog::shutdown();
 		return 1;
@@ -269,6 +366,8 @@ DLLFUNC_C int BrokerLogin(char *User, char *Pwd, char *Type, char *Account) {
 		if (!streamManager) {
 			streamManager = std::make_unique<futures::WSStreamManager>(restClient);
 			streamManager->setLoggerCallback(&logFunction);
+			streamManager->setTimeout(STREAM_READ_TIMEOUT_S);
+			streamManager->setMaxTickAge(MAX_TICK_AGE_S);
 		}
 	} catch (std::exception &e) {
 		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
@@ -296,42 +395,80 @@ BrokerAsset(char *Asset, double *pPrice, double *pSpread, double *pVolume, doubl
 	const auto currentMinute = stonky::getMsTimestamp(stonky::currentTime()).count() / 60000;
 
 	/// NOTE: Do not log normal state, this function is called ver often!
-	if (!streamManager) {
+	if (!Asset || !*Asset) {
+		return 0;
+	}
+
+	if (!restClient || !streamManager) {
 		spdlog::critical(fmt::format("{}: {}", MAKE_FILELINE, "Binance WS stream manager instance not initialized."));
 		return 0;
 	}
 
-	if (pPip != nullptr) {
-		try {
-			for (const auto exchangeInfo = restClient->getExchangeInfo(); const auto &el: exchangeInfo.symbols) {
-				if (el.symbol == Asset) {
-					for (const auto &fEl: el.filters) {
-						if (fEl.filterType == futures::SymbolFilter::LOT_SIZE) {
-							if (pLotAmount) {
-								*pLotAmount = fEl.stepSize;
-#ifdef _WIN64
-								lotAmounts.insert_or_assign(Asset, fEl.stepSize);
-#endif
-							}
-						} else if (fEl.filterType == futures::SymbolFilter::PRICE_FILTER) {
-							*pPip = fEl.tickSize;
-						}
-					}
+	/// Zorro subscribes an asset by calling with pPrice == NULL and only afterwards asks for prices
+	const bool subscribing = pPrice == nullptr;
 
-					if (pPipCost && *pPip != 0.0 && *pLotAmount != 0.0) {
-						*pPipCost = *pPip * *pLotAmount;
-					}
+	if (pPip != nullptr || subscribing) {
+		/// Contract parameters of the asset
+		try {
+			const auto symbolInfo = restClient->getSymbolInfo(Asset);
+
+			if (!symbolInfo) {
+				const auto msg = "Unknown asset: " + std::string(Asset);
+				spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+				BrokerError(msg.c_str());
+				return 0;
+			}
+
+			double tickSize = 0.0;
+			double stepSize = 0.0;
+
+			for (const auto &fEl: symbolInfo->filters) {
+				if (fEl.filterType == futures::SymbolFilter::LOT_SIZE) {
+					stepSize = fEl.stepSize;
+				} else if (fEl.filterType == futures::SymbolFilter::PRICE_FILTER) {
+					tickSize = fEl.tickSize;
 				}
 			}
+
+			if (tickSize <= 0.0 || stepSize <= 0.0) {
+				const auto msg = "Incomplete asset info for: " + std::string(Asset);
+				spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+				BrokerError(msg.c_str());
+				return 0;
+			}
+
+			if (pPip) {
+				*pPip = tickSize;
+			}
+
+			if (pLotAmount) {
+				*pLotAmount = stepSize;
+			}
+
+			if (pPipCost) {
+				*pPipCost = tickSize * stepSize;
+			}
+
+#ifdef _WIN64
+			lotAmounts.insert_or_assign(Asset, stepSize);
+#endif
 		} catch (std::exception &e) {
 			spdlog::error(fmt::format("{}: {}\n", MAKE_FILELINE, e.what()));
 			BrokerError("Cannot acquire asset info from server.");
+			return 0;
 		}
 	}
 
 	try {
 		/// Check if the Book Ticker Stream is subscribed for the Asset
 		streamManager->subscribeBookTickerStream(Asset);
+
+		if (subscribing) {
+			/// Subscription call - the asset exists and its stream is running, that is all Zorro asks for here.
+			/// It must NOT depend on a tick having arrived: an asset that returns 0 after subscription triggers
+			/// Error 053 and gets its trading disabled, while an illiquid symbol can stay silent for minutes.
+			return 1;
+		}
 
 #ifdef EXPERIMENTAL
 		/// TODO: Candle interval must correspond to BAR size (but how to set it?)
@@ -340,7 +477,7 @@ BrokerAsset(char *Asset, double *pPrice, double *pSpread, double *pVolume, doubl
 		auto candlestick = streamManager->readEventCandlestick(Asset, CandleInterval::_1m);
 
 		if (candlestick) {
-			const auto candleMinute = candlestick.value().m_k.m_t / 60000;
+			const auto candleMinute = candlestick.value().k.t / 60000;
 			auto timeStruct = std::gmtime(&currentS);
 			if (timeStruct->tm_sec == 0) {
 				if (currentMinute == candleMinute) {
@@ -359,10 +496,14 @@ BrokerAsset(char *Asset, double *pPrice, double *pSpread, double *pVolume, doubl
 
 #endif
 
+		/// Reading falls back to a REST snapshot when the stream stays silent, which is the normal case for an
+		/// illiquid symbol - the best bid/ask simply does not change for minutes.
 		if (const auto tickPrice = streamManager->readEventTickPrice(Asset)) {
 			const auto &tickerPrice = *tickPrice;
 
-			if (tickerPrice.a == 0.0 || tickerPrice.b == 0.0) {
+			if (tickerPrice.a <= 0.0 || tickerPrice.b <= 0.0) {
+				const auto msg = "Invalid bid/ask for Asset: " + std::string(Asset);
+				spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
 				return 0;
 			}
 
@@ -375,9 +516,9 @@ BrokerAsset(char *Asset, double *pPrice, double *pSpread, double *pVolume, doubl
 			if (pVolume) {
 #ifdef EXPERIMENTAL
 				if (candlestick) {
-					*pVolume = candlestick->m_k.m_v;
+					*pVolume = candlestick->k.v;
 				} else {
-					*pVolume = tickerPrice.m_A + tickerPrice.m_B;
+					*pVolume = tickerPrice.A + tickerPrice.B;
 				}
 #else
 				*pVolume = tickerPrice.A + tickerPrice.B;
@@ -409,16 +550,32 @@ DLLFUNC_C int BrokerAccount(char *Account, double *pdBalance, double *pdTradeVal
 	}
 
 	try {
-		const auto accountBalances = restClient->getAccountBalances();
+		const auto account = restClient->getAccountInfo();
 
-		if (pdBalance) {
-			for (const auto &el: accountBalances) {
-				if (el.asset == accountCurrency) {
-					*pdBalance = std::round(el.balance);
-					return 1;
-				}
+		for (const auto &el: account.assets) {
+			if (el.asset != accountCurrency) {
+				continue;
 			}
+
+			if (pdBalance) {
+				*pdBalance = el.walletBalance;
+			}
+
+			/// Value of open positions and the margin they bind - without those Zorro cannot track equity
+			if (pdTradeVal) {
+				*pdTradeVal = el.unrealizedProfit;
+			}
+
+			if (pdMarginVal) {
+				*pdMarginVal = el.initialMargin;
+			}
+
+			return 1;
 		}
+
+		const auto msg = "Account currency not found: " + accountCurrency;
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+		BrokerError(msg.c_str());
 	} catch (std::exception &e) {
 		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
 		BrokerError("Cannot acquire account info from server.");
@@ -447,6 +604,10 @@ DLLFUNC_C int BrokerTime(DATE *pTimeGMT) {
 }
 
 DLLFUNC_C int GetLastFundingRate(char *Asset, double *fundingTime, double *fundingRate) {
+	if (!Asset || !restClient) {
+		return 0;
+	}
+
 	try {
 		const auto rate = restClient->getLastFundingRate(Asset);
 		if (fundingRate && fundingTime) {
@@ -461,6 +622,10 @@ DLLFUNC_C int GetLastFundingRate(char *Asset, double *fundingTime, double *fundi
 }
 
 DLLFUNC_C int AssetMinuteCandleREST(char *Asset, T6 *candles, int maxCandles) {
+	if (!Asset || !restClient) {
+		return 0;
+	}
+
 	if (candles) {
 		const std::time_t from = std::time(nullptr) * 1000 - maxCandles * 60000;
 		const std::time_t to = std::time(nullptr) * 1000;
@@ -487,6 +652,10 @@ DLLFUNC_C int AssetMinuteCandleREST(char *Asset, T6 *candles, int maxCandles) {
 }
 
 DLLFUNC_C int AssetMinuteCandle(char *Asset, int previous, T6 *candle) {
+	if (!Asset || !streamManager) {
+		return 0;
+	}
+
 	if (candle) {
 		if (const auto candleEvent = streamManager->readEventCandlestick(
 			Asset, CandleInterval::_1m, static_cast<bool>(previous))) {
@@ -532,6 +701,10 @@ DLLFUNC_C int PreloadMinuteCandles(char **Assets, int numAssets, int numCandles)
 }
 
 DLLFUNC_C int GetPreloadedMinuteCandles(char *Asset, T6 *candles, int maxCandles, int &numRead) {
+	if (!Asset || !candles) {
+		return 0;
+	}
+
 	if (const auto it = lastCandles.find(Asset); it != lastCandles.end()) {
 		const auto maxElements = std::min(maxCandles, static_cast<int>(it->second.size()));
 		numRead = maxElements;
@@ -550,6 +723,10 @@ DLLFUNC_C int GetPreloadedMinuteCandles(char *Asset, T6 *candles, int maxCandles
 }
 
 DLLFUNC_C int GetMaxPositionValue(char *Asset, double *amount) {
+	if (!Asset || !restClient) {
+		return 0;
+	}
+
 	try {
 		const auto positionRisk = restClient->getPositionRisk(Asset);
 
@@ -570,19 +747,28 @@ DLLFUNC_C int GetMaxPositionValue(char *Asset, double *amount) {
 }
 
 DLLFUNC_C int GetPositionLimits(char *Asset, double *lotSize, double *marketLotSize) {
+	if (!Asset || !restClient) {
+		return 0;
+	}
+
 	try {
-		for (const auto exchangeInfo = restClient->getExchangeInfo(); const auto &el: exchangeInfo.symbols) {
-			if (el.symbol == Asset) {
-				for (const auto &fEl: el.filters) {
-					if (fEl.filterType == futures::SymbolFilter::LOT_SIZE) {
-						if (lotSize) {
-							*lotSize = fEl.maxQty;
-						}
-					} else if (fEl.filterType == futures::SymbolFilter::MARKET_LOT_SIZE) {
-						if (marketLotSize) {
-							*marketLotSize = fEl.maxQty;
-						}
-					}
+		const auto symbolInfo = restClient->getSymbolInfo(Asset);
+
+		if (!symbolInfo) {
+			const auto msg = "Unknown asset: " + std::string(Asset);
+			spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+			BrokerError(msg.c_str());
+			return 0;
+		}
+
+		for (const auto &fEl: symbolInfo->filters) {
+			if (fEl.filterType == futures::SymbolFilter::LOT_SIZE) {
+				if (lotSize) {
+					*lotSize = fEl.maxQty;
+				}
+			} else if (fEl.filterType == futures::SymbolFilter::MARKET_LOT_SIZE) {
+				if (marketLotSize) {
+					*marketLotSize = fEl.maxQty;
 				}
 			}
 		}
@@ -596,6 +782,10 @@ DLLFUNC_C int GetPositionLimits(char *Asset, double *lotSize, double *marketLotS
 }
 
 DLLFUNC_C int ChangeInitialLeverage(char *Asset, int targetLeverage, int *leverage, double *maxNotionalValue) {
+	if (!Asset || !restClient) {
+		return 0;
+	}
+
 	try {
 		const auto [fst, snd] = restClient->changeInitialLeverage(Asset, targetLeverage);
 
@@ -678,6 +868,10 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 		return 0;
 	}
 
+	if (!Asset || !*Asset || Amount == 0) {
+		return 0;
+	}
+
 	try {
 #ifdef _WIN64
 		if (auto it = lotAmounts.find(Asset); it != lotAmounts.end()) {
@@ -716,14 +910,12 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 			order.timeInForce = TimeInForce::FOK;
 		}
 
+		/// NOTE: dStopDist is deliberately ignored - this plugin does not place a broker side stop order, so the
+		/// stop loss stays with Zorro and is only executed while Zorro is running. See README.
 		if (Limit > 0.) {
 			order.price = Limit;
 			order.type = futures::OrderType::LIMIT;
-		} /*else if (dStopDist != 0.0 && dStopDist != -1) {
-            order.m_price = Limit;
-            order.m_stopPrice = dStopDist;
-            order.m_type = futures::OrderType::STOP;
-        } */ else {
+		} else {
 			order.type = futures::OrderType::MARKET;
 		}
 
@@ -734,29 +926,47 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 		order.newClientOrderId = std::to_string(lastOrderId++);
 		writeLastOrderId();
 
-		if (futures::OrderResponse orderResponse = restClient->sendOrder(order);
-			orderResponse.orderStatus == futures::OrderStatus::FILLED) {
-			if (pPrice) {
+		const futures::OrderResponse orderResponse = restClient->sendOrder(order);
+		const auto filledLots = static_cast<int>(std::round(orderResponse.executedQty / lotAmount));
+
+		/// A GTC limit order normally comes back as NEW - it rests on the book and must NOT be reported as a
+		/// failure, otherwise it stays open on the exchange while Zorro believes nothing happened. A partially
+		/// filled IOC comes back as EXPIRED with a non-zero executed quantity - the fill is a real position and
+		/// must be reported as well.
+		if (orderResponse.orderStatus == futures::OrderStatus::FILLED ||
+		    orderResponse.orderStatus == futures::OrderStatus::PARTIALLY_FILLED ||
+		    orderResponse.orderStatus == futures::OrderStatus::NEW ||
+		    filledLots > 0) {
+			const auto tradeId = std::stoi(orderResponse.clientOrderId);
+
+			if (pPrice && orderResponse.avgPrice > 0.0) {
 				*pPrice = orderResponse.avgPrice;
 			}
 
 			if (pFill) {
-				*pFill = std::round(orderResponse.executedQty / lotAmount);
+				*pFill = filledLots;
 			}
 
-			spdlog::info("Order placed for asset: " + std::string(Asset) + ", filled size: " +
+			spdlog::info("Order placed for asset: " + std::string(Asset) + ", status: " +
+			             std::string(magic_enum::enum_name(orderResponse.orderStatus)) + ", filled size: " +
 			             std::to_string(orderResponse.executedQty / lotAmount) + ", price: " +
 			             std::to_string(orderResponse.avgPrice) + ", clientId: " + orderResponse.clientOrderId);
 
-			saveAssetForTradeId(Asset, stoi(orderResponse.clientOrderId));
-			return std::stoi(orderResponse.clientOrderId);
-		} else {
-			std::string msg =
-					"Cannot place order: " + std::string(Asset) + ", size: " + std::to_string(Amount) +
-					", reason: " + std::string(magic_enum::enum_name(orderResponse.orderStatus));
-			spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
-			BrokerError(msg.c_str());
+			storeOpenTrade(tradeId, Asset, Amount);
+			return tradeId;
 		}
+
+		std::string msg =
+				"Cannot place order: " + std::string(Asset) + ", size: " + std::to_string(Amount) +
+				", reason: " + std::string(magic_enum::enum_name(orderResponse.orderStatus));
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+		BrokerError(msg.c_str());
+	} catch (const TransportError &e) {
+		/// The order may well have reached the exchange - reporting a rejection here would risk a duplicate order.
+		/// -2 tells Zorro that the broker did not confirm within the wait time.
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
+		BrokerError("No confirmation from server, order state unknown.");
+		return -2;
 	} catch (std::exception &e) {
 		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
 		BrokerError("Cannot send order to server.");
@@ -768,16 +978,23 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 DLLFUNC_C int
 BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCost, double *pProfit, int *pFill) {
 	if (!restClient) {
-		spdlog::critical(fmt::format("{}: {}", MAKE_FILELINE, "Bybit Rest Client instance not initialized."));
+		spdlog::critical(fmt::format("{}: {}", MAKE_FILELINE, "Binance Rest Client instance not initialized."));
+		return 0;
+	}
+
+	if (nAmount == 0) {
 		return 0;
 	}
 
 	try {
-		auto asset = findAssetForTradeId(nTradeId);
+		/// Do NOT drop the mapping here - if the closing order fails the trade would become impossible to close
+		const auto openTrade = findOpenTrade(nTradeId);
 
-		if (asset.empty()) {
+		if (!openTrade) {
 			return 0;
 		}
+
+		const auto asset = openTrade->asset;
 
 #ifdef _WIN64
 		if (auto it = lotAmounts.find(asset); it != lotAmounts.end()) {
@@ -799,6 +1016,13 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 			order.positionSide = futures::PositionSide::SHORT;
 		}
 
+		/// In One-way mode Binance rejects any positionSide other than BOTH (-4061), the closing intent is
+		/// expressed by reduceOnly instead
+		if (!hedge) {
+			order.positionSide = futures::PositionSide::BOTH;
+			order.reduceOnly = true;
+		}
+
 		if (Limit > 0.) {
 			order.price = Limit;
 			order.type = futures::OrderType::LIMIT;
@@ -815,31 +1039,115 @@ BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCo
 
 		order.timeInForce = TimeInForce::GTC;
 
-		if (auto orderResponse = restClient->sendOrder(order);
-			orderResponse.orderStatus == futures::OrderStatus::FILLED) {
+		const futures::OrderResponse orderResponse = restClient->sendOrder(order);
+		const auto filledLots = static_cast<int>(std::round(orderResponse.executedQty / lotAmount));
+
+		/// A partial close (IOC leftovers expired) still closed real lots and must be booked
+		if (orderResponse.orderStatus == futures::OrderStatus::FILLED ||
+		    orderResponse.orderStatus == futures::OrderStatus::PARTIALLY_FILLED ||
+		    orderResponse.orderStatus == futures::OrderStatus::NEW ||
+		    filledLots > 0) {
 			if (pFill) {
-				*pFill = std::round(orderResponse.executedQty / lotAmount);
+				*pFill = filledLots;
 			}
 
-			spdlog::info("Order placed for asset: " + std::string(asset) + ", filled size: " +
+			if (pClose && orderResponse.avgPrice > 0.0) {
+				*pClose = orderResponse.avgPrice;
+			}
+
+			spdlog::info("Closing order placed for asset: " + std::string(asset) + ", status: " +
+			             std::string(magic_enum::enum_name(orderResponse.orderStatus)) + ", filled size: " +
 			             std::to_string(orderResponse.executedQty / lotAmount) + ", price: " +
 			             std::to_string(orderResponse.avgPrice) + ", clientId: " + orderResponse.clientOrderId);
 
-			saveAssetForTradeId(asset, stoi(orderResponse.clientOrderId));
-			return std::stoi(orderResponse.clientOrderId);
-		} else {
-			std::string msg =
-					"Cannot place order: " + std::string(asset) + ", size: " + std::to_string(nAmount) +
-					", reason: " + std::string(magic_enum::enum_name(orderResponse.orderStatus));
-			spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
-			BrokerError(msg.c_str());
+			/// Book the closed lots against the record, it is dropped once nothing is left open
+			if (filledLots > 0) {
+				reduceOpenTrade(nTradeId, filledLots);
+			}
+
+			/// Zorro keeps addressing the remainder by the original id
+			return nTradeId;
 		}
+
+		std::string msg =
+				"Cannot place order: " + std::string(asset) + ", size: " + std::to_string(nAmount) +
+				", reason: " + std::string(magic_enum::enum_name(orderResponse.orderStatus));
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, msg));
+		BrokerError(msg.c_str());
+	} catch (const TransportError &e) {
+		/// BrokerSell2 has no return code for "unknown state", so Zorro will retry. A repeated close is bounded by
+		/// the position itself - reduceOnly in One-way mode, position reducing side/positionSide in Hedge mode.
+		spdlog::error(fmt::format("{}: closing order not confirmed, state unknown: {}", MAKE_FILELINE, e.what()));
+		BrokerError("No confirmation from server, close state unknown.");
 	} catch (std::exception &e) {
 		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
 		BrokerError("Cannot close trade.");
 	}
 
 	return 0;
+}
+
+/**
+ * Report the fill state of an order/trade back to Zorro. Without it Zorro cannot tell whether a resting limit order
+ * has been filled in the meantime.
+ *
+ * Return value (Zorro broker API): current fill amount in lots as in BrokerBuy2, -1 when the trade was completely
+ * closed, NAY when the state is unavailable, NAY-1 when the order was cancelled or removed by the broker.
+ */
+DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *pCost, double *pProfit) {
+	if (!restClient) {
+		spdlog::critical(fmt::format("{}: {}", MAKE_FILELINE, "Binance Rest Client instance not initialized."));
+		return NAY;
+	}
+
+	const auto openTrade = findOpenTrade(nTradeId);
+
+	if (!openTrade) {
+		/// Nothing open under this id - either it was closed through this plugin, or it is simply not known here
+		return wasTradeClosed(nTradeId) ? -1 : NAY;
+	}
+
+	try {
+#ifdef _WIN64
+		if (const auto it = lotAmounts.find(openTrade->asset); it != lotAmounts.end()) {
+			lotAmount = it->second;
+		} else {
+			spdlog::error(fmt::format("{}: Cannot find lot amount size for asset: {}", MAKE_FILELINE,
+			                          openTrade->asset));
+			return NAY;
+		}
+#endif
+		const auto orderResponse = restClient->queryOrder(openTrade->asset, std::to_string(nTradeId));
+		const auto filledLots = static_cast<int>(std::round(orderResponse.executedQty / lotAmount));
+
+		if (pOpen && orderResponse.avgPrice > 0.0) {
+			*pOpen = orderResponse.avgPrice;
+		}
+
+		/// The queried order carries the size it was opened with, the record carries what is still open after
+		/// partial closes. Legacy records have no size, there the order is the only source of truth.
+		const auto openLots = openTrade->lots != 0
+			                      ? std::min(std::abs(openTrade->lots), filledLots)
+			                      : filledLots;
+
+		switch (orderResponse.orderStatus) {
+			case futures::OrderStatus::FILLED:
+			case futures::OrderStatus::PARTIALLY_FILLED:
+				return openLots;
+			case futures::OrderStatus::NEW:
+			case futures::OrderStatus::PENDING_CANCEL:
+				/// Still resting on the book, nothing filled yet
+				return 0;
+			default:
+				/// CANCELED, REJECTED, EXPIRED - whatever got filled before is a real position, if nothing was
+				/// filled the order is gone from the broker
+				return openLots > 0 ? openLots : NAY - 1;
+		}
+	} catch (std::exception &e) {
+		spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
+	}
+
+	return NAY;
 }
 
 DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
@@ -857,6 +1165,12 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 			return 1;
 		case SET_WAIT:
 			waitMs = dwParameter;
+
+			/// Drives how long a price read may block before falling back to the REST snapshot. Clamped so that a
+			/// generous Zorro setting cannot stall the whole asset loop.
+			if (streamManager) {
+				streamManager->setTimeout(std::clamp(waitMs / 1000, 1, STREAM_READ_TIMEOUT_S));
+			}
 		case GET_WAIT:
 			return waitMs;
 		case SET_SYMBOL:
@@ -874,10 +1188,23 @@ DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter) {
 						totalPositionAmt += position.positionAmt;
 					}
 
-					/// Return real position size instead of lot amount
-					/// totalPositionAmt = totalPositionAmt / lotAmount;
+					/// Zorro expects the net open amount in the same unit as BrokerBuy2, i.e. in lots, not in
+					/// contracts. The lot size is per symbol, the global lotAmount belongs to the last order.
+					double symbolLotAmount = lotAmount;
+#ifdef _WIN64
+					if (const auto it = lotAmounts.find(symbol); it != lotAmounts.end()) {
+						symbolLotAmount = it->second;
+					} else {
+						spdlog::error(fmt::format("{}: Cannot find lot amount size for asset: {}", MAKE_FILELINE,
+						                          symbol));
+						return 0;
+					}
+#endif
+					if (symbolLotAmount <= 0.0) {
+						return 0;
+					}
 
-					return totalPositionAmt;
+					return totalPositionAmt / symbolLotAmount;
 				} catch (std::exception &e) {
 					spdlog::error(fmt::format("{}: {}", MAKE_FILELINE, e.what()));
 					BrokerError(std::string("Cannot get position of " + std::string(symbol)).c_str());

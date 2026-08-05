@@ -3,7 +3,7 @@ project(binance_futures_zorro_plugin)
 
 set(CMAKE_CXX_FLAGS_RELEASE "/Ox")
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 add_definitions(-D_WIN32_WINNT=0x0A00 /utf-8)
 
 find_package(spdlog CONFIG REQUIRED)

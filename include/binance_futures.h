@@ -37,6 +37,7 @@ DLLFUNC_C int BrokerBuy2(char *Asset, int Amount, double dStopDist, double Limit
 DLLFUNC_C double BrokerCommand(int Command, DWORD dwParameter);
 DLLFUNC_C int BrokerAccount(char *Account, double *pdBalance, double *pdTradeVal, double *pdMarginVal);
 DLLFUNC_C int BrokerSell2(int nTradeId, int nAmount, double Limit, double *pClose, double *pCost, double *pProfit, int *pFill);
+DLLFUNC_C int BrokerTrade(int nTradeId, double *pOpen, double *pClose, double *pCost, double *pProfit);
 
 DLLFUNC_C int AssetMinuteCandle(char *Asset, int previous, T6 *candle);
 DLLFUNC_C int AssetMinuteCandleREST(char *Asset, T6 *candles, int maxCandles);

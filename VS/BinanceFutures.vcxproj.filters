@@ -16,15 +16,15 @@
     <Filter Include="common">
       <UniqueIdentifier>{1d46cf0f-295d-44d1-9ff7-38b45e8ba4f4}</UniqueIdentifier>
     </Filter>
-    <Filter Include="binance_cpp_api">
+    <Filter Include="binance-cpp-api">
       <UniqueIdentifier>{b3950f24-c13c-423b-a44e-30489848d7d8}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h">
+    <ClInclude Include="..\include\binance_futures.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="pch.h">
+    <ClInclude Include="..\include\stdafx.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -38,37 +38,37 @@
     <ClCompile Include="..\src\stdafx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_event_models.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_event_models.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_rest_client.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_rest_client.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_ws_client.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_ws_client.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_ws_session.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_ws_session.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_http_session.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_http_session.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_models.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_models.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_spot_rest_client.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_spot_rest_client.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\src\binance_ws_stream_manager.cpp">
-      <Filter>binance_cpp_api</Filter>
+    <ClCompile Include="..\binance-cpp-api\src\binance_ws_stream_manager.cpp">
+      <Filter>binance-cpp-api</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\vk_cpp_common\src\registry.cpp">
+    <ClCompile Include="..\binance-cpp-api\stonky-cpp-common\src\registry.cpp">
       <Filter>common</Filter>
     </ClCompile>
-    <ClCompile Include="..\binance_cpp_api\vk_cpp_common\src\utils.cpp">
+    <ClCompile Include="..\binance-cpp-api\stonky-cpp-common\src\utils.cpp">
       <Filter>common</Filter>
     </ClCompile>
   </ItemGroup>

@@ -59,9 +59,9 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;BINANCE_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\binance_cpp_api\vk_cpp_common\include;$(ProjectDir)..\binance_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\binance-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\binance-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -85,8 +85,8 @@
       <PreprocessorDefinitions>NDEBUG;BINANCE_FUTURES_DLL_EXPORTS;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;VERBOSE_LOG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\binance_cpp_api\vk_cpp_common\include;$(ProjectDir)..\binance_cpp_api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\binance-cpp-api\stonky-cpp-common\include;$(ProjectDir)..\binance-cpp-api\include;$(ProjectDir)..\include</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
       <AdditionalOptions>/bigobj /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
@@ -103,21 +103,21 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="framework.h" />
-    <ClInclude Include="pch.h" />
+    <ClInclude Include="..\include\binance_futures.h" />
+    <ClInclude Include="..\include\stdafx.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\binance_cpp_api\src\binance.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_event_models.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_rest_client.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_ws_client.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_futures_ws_session.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_http_session.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_models.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_spot_rest_client.cpp" />
-    <ClCompile Include="..\binance_cpp_api\src\binance_ws_stream_manager.cpp" />
-    <ClCompile Include="..\binance_cpp_api\vk_cpp_common\src\registry.cpp" />
-    <ClCompile Include="..\binance_cpp_api\vk_cpp_common\src\utils.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_event_models.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_rest_client.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_ws_client.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_futures_ws_session.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_http_session.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_models.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_spot_rest_client.cpp" />
+    <ClCompile Include="..\binance-cpp-api\src\binance_ws_stream_manager.cpp" />
+    <ClCompile Include="..\binance-cpp-api\stonky-cpp-common\src\registry.cpp" />
+    <ClCompile Include="..\binance-cpp-api\stonky-cpp-common\src\utils.cpp" />
     <ClCompile Include="..\dllmain.cpp" />
     <ClCompile Include="..\src\binance_futures.cpp" />
     <ClCompile Include="..\src\stdafx.cpp" />
