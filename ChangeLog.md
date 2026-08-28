@@ -1,7 +1,7 @@
 # Changelog
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [Unreleased]
+## [2.0.0](https://github.com/StonkyLab/zorro-binance-futures-plugin/releases/tag/2.0.0) (2026-08-29)
 
 ### Changed
 
@@ -70,6 +70,11 @@ All notable changes to this project will be documented in this file. This projec
 - The exchange info was re-downloaded every 60 seconds, now every 15 minutes, and hot paths no longer copy the whole
   multi hundred symbol structure just to read one value.
 - `NEW` from Zorro's `trading.h` collided with `futures::OrderStatus::NEW`.
+
+### Notes
+
+- The plugin API level reported by `BrokerOpen` stays at 2, that is the Zorro broker API generation the plugin
+  implements, not the plugin's own version.
 
 ## [1.0.0](https://github.com/stawe-org/tools_zorro_binance_plugin/releases/tag/1.0.0) (2025-11-13)
 

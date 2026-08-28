@@ -24,8 +24,8 @@ Copyright (c) 2025 Vitezslav Kot <vitezslav.kot@stonky.cz>, Stonky s.r.o.
 #include "magic_enum/magic_enum.hpp"
 
 #define PLUGIN_VERSION    2
-#define PLUGIN_VERSION_STR "1.0.0"
-#define PLUGIN_VERSION_RELEASE_DATE "13-november-2025"
+#define PLUGIN_VERSION_STR "2.0.0"
+#define PLUGIN_VERSION_RELEASE_DATE "29-august-2026"
 #undef min
 /// Zorro's trading.h defines NEW as a chart flag, which collides with futures::OrderStatus::NEW
 #undef NEW
