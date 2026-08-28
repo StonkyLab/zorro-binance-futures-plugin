@@ -32,10 +32,9 @@ All notable changes to this project will be documented in this file. This projec
 - The store was written by opening the target file directly, which truncates it first - a crash or a full disk in
   the middle of the write destroyed the trade to symbol mapping. It is written to a temporary file and renamed over
   the target now, and a failed write is reported to Zorro instead of only being logged.
-- Blocking socket operations had no bound at all, so a black holed connection could stall the Zorro thread
-  indefinitely. They are now bounded by the `SET_WAIT` time. NOTE: effective on Windows; on POSIX Asio cannot tell a
-  socket timeout from a non-blocking would-block and keeps polling, so bounding it there needs the request path
-  rewritten to async operations.
+- Blocking socket operations had no bound at all, so a black holed connection could stall the Zorro thread until the
+  operating system gave up, which is minutes. Every read and write of a request is now bounded by the `SET_WAIT`
+  time. The connect itself still falls back to the Windows connect timeout.
 - `setCredentials` replaced the HTTP session without synchronization while the background instrument updater was
   using it - a data race, and the `reset()` before the assignment even left a window with a null session.
 - The hedge flag was only ever set to true. After the account was switched to One-way mode the plugin kept sending
