@@ -12,9 +12,13 @@ Binance Futures Plugin for Zorro Trader
   handled by Zorro and therefore only works while Zorro is running.
 - Both **Hedge** and **One-way** position modes are supported, the mode is detected at login.
 - **Demo mode is not supported**, the plugin refuses to log in with `Type == "Demo"`.
-- The account currency defaults to `USDT` when Zorro passes no account name.
-- A limit order that rests on the book is reported to Zorro as a pending trade with a fill amount of 0, `BrokerTrade`
-  then reports the fill state.
+- **The `Account` field is read as the margin asset, not as an account id.** Zorro passes the account name or
+  number from its account list, this plugin interprets it as the coin whose wallet balance is reported (`USDT` when
+  the field is empty). Leave it empty or set it to the margin asset; an arbitrary account identifier there makes
+  `BrokerAccount` fail with "Account currency not found".
+- A limit ENTRY order that rests on the book is reported to Zorro as a pending trade with a fill amount of 0;
+  `BrokerTrade` then reports its fill state. **Closing orders are always sent IOC**, so they never rest on the
+  book - a close that could be left hanging would keep filling with nothing tracking it.
 - Prices come from the `bookTicker` WebSocket stream. Because that stream only pushes when the best bid/ask changes,
   the plugin seeds and refreshes them from the REST snapshot endpoint, which keeps illiquid symbols usable.
 - The trade id to symbol mapping is persisted in `Zorro/Data/binance_open_trades.json` and survives a restart.
